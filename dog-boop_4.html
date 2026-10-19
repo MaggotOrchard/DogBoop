@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Boop!</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0b1f4d; }
+  #area {
+    position:fixed; inset:0; overflow:hidden;
+    background: radial-gradient(circle at 30% 20%, #16357a 0%, #0b1f4d 70%);
+    touch-action:none; user-select:none; -webkit-user-select:none;
+    -webkit-touch-callout:none; -webkit-tap-highlight-color:transparent;
+  }
+  .buddy { position:absolute; left:0; top:0; will-change:transform; pointer-events:none; }
+  .buddy svg, .buddy .photo { display:block; width:100%; height:100%; }
+  .photo {
+    border-radius:50%; border:6px solid #ffd93d; box-sizing:border-box;
+    background:#16357a center/cover no-repeat;
+    box-shadow:0 6px 18px rgba(0,0,0,.4);
+  }
+  .glow { filter:drop-shadow(0 0 22px #ffd93d); }
+  .burst { position:absolute; pointer-events:none; will-change:transform,opacity; }
+  /* human-only controls: hold the corner for 1.5s */
+  #gear {
+    position:absolute; top:0; left:0; width:64px; height:64px; z-index:5;
+    color:rgba(255,255,255,.14); font:28px sans-serif; display:flex;
+    align-items:center; justify-content:center;
+  }
+  #panel {
+    position:absolute; top:12px; left:12px; z-index:10; display:none;
+    background:#fff; color:#111; font:16px sans-serif; padding:14px; border-radius:12px;
+    max-width:260px; box-shadow:0 8px 30px rgba(0,0,0,.5);
+  }
+  #panel button { display:block; width:100%; margin:6px 0; padding:12px; font-size:16px; border-radius:8px; border:1px solid #888; background:#f3f3f3; }
+  #panel small { color:#555; display:block; margin-top:6px; }
+  #review { position:fixed; inset:0; z-index:30; background:#fff; display:none; overflow:auto; font:16px sans-serif; color:#111; }
+  #reviewBar { position:sticky; top:0; background:#fff; padding:10px; border-bottom:1px solid #ccc; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #reviewBar button { padding:12px 16px; font-size:16px; border-radius:8px; border:1px solid #888; background:#f3f3f3; }
+  #rvGrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px; padding:10px; }
+  .cand { aspect-ratio:1; background:#ddd center/cover no-repeat; border-radius:10px; border:5px solid transparent; box-sizing:border-box; }
+  .cand.on { border-color:#ffb300; box-shadow:0 0 0 3px #0b1f4d; }
+  #hint { position:absolute; bottom:8px; right:14px; color:rgba(255,255,255,.18); font:12px sans-serif; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="area">
+  <div id="gear">⚙</div>
+  <div id="hint">boop anywhere · swipe to scatter</div>
+  <div id="panel">
+    <b>Grown-up settings</b>
+    <button id="fs">Go fullscreen</button>
+    <button id="findCats">Find cat photos to choose from (internet)</button>
+    <button id="clearCats">Remove approved cat photos</button>
+    <button id="addPhotos">Add my own photos (cats, animals…)</button>
+    <button id="addMeows">Add my own meow sounds</button>
+    <button id="clearPhotos">Remove my added photos</button>
+    <button id="closePanel">Close</button>
+    <small id="photoCount"></small>
+    <input id="file" type="file" accept="image/*" multiple style="display:none">
+    <input id="meowFile" type="file" accept="audio/*" multiple style="display:none">
+  </div>
+</div>
+<div id="review">
+  <div id="reviewBar">
+    <button id="rvSave">Save selected</button>
+    <button id="rvMore">Load more</button>
+    <button id="rvOwn">Add my own photos</button>
+    <button id="rvClose">Cancel</button>
+    <span id="rvInfo"></span>
+  </div>
+  <div id="rvGrid"></div>
+</div>
+
+<script>
+(function () {
+  const area = document.getElementById('area');
+  const ACCENT = '#ffd93d', INK = '#0b1f4d';
+
+  /* ================= Photo storage ================= */
+  let photos = [];    // photos you add by hand
+  let catPool = [];   // real cat photos fetched automatically (cached on the tablet)
+  // new store name on purpose: anything auto-downloaded by the earlier version is ignored
+  const DB_USER = 'boop-db', DB_CATS = 'boop-cats-approved';
+
+  function openDB(name) {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open(name, 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('p', { autoIncrement: true });
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  }
+  async function dbGetAll(name) {
+    try {
+      const db = await openDB(name);
+      return await new Promise((res, rej) => {
+        const q = db.transaction('p').objectStore('p').getAll(); q.onsuccess = () => res(q.result); q.onerror = rej;
+      });
+    } catch (e) { return []; }
+  }
+  async function dbAdd(name, v) { try { const db = await openDB(name); db.transaction('p', 'readwrite').objectStore('p').add(v); } catch (e) {} }
+  async function dbClear(name) { try { const db = await openDB(name); db.transaction('p', 'readwrite').objectStore('p').clear(); } catch (e) {} }
+
+  // center-crop to a square and shrink, so photos stay light
+  function shrink(blob) {
+    return new Promise((res) => {
+      const img = new Image(), url = URL.createObjectURL(blob);
+      img.onload = () => {
+        const side = Math.min(img.width, img.height);
+        const c = document.createElement('canvas');
+        c.width = c.height = Math.min(500, side);
+        c.getContext('2d').drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url); res(c.toDataURL('image/jpeg', 0.85));
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); res(null); };
+      img.src = url;
+    });
+  }
+  function preload(url) {
+    return new Promise((res) => { const i = new Image(); i.onload = () => res(true); i.onerror = () => res(false); i.src = url; });
+  }
+
+  /* ================= Cat photo picker: a grown-up approves every photo ================= */
+  const catURL = () => `https://cataas.com/cat?width=500&height=500&t=${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const review = document.getElementById('review'), rvGrid = document.getElementById('rvGrid'), rvInfo = document.getElementById('rvInfo');
+  const picked = new Set();
+  function addCandidate(src) {
+    const d = document.createElement('div'); d.className = 'cand';
+    d.style.backgroundImage = `url("${src}")`;
+    d.onclick = () => { if (picked.has(src)) { picked.delete(src); d.classList.remove('on'); } else { picked.add(src); d.classList.add('on'); } rvInfo.textContent = picked.size + ' selected'; };
+    rvGrid.appendChild(d);
+  }
+  async function loadCandidates(n) {
+    rvInfo.textContent = 'Loading…';
+    let ok = 0;
+    for (let i = 0; i < n; i += 6) {
+      const batch = await Promise.all(Array.from({ length: Math.min(6, n - i) }, async () => {
+        try { const r = await fetch(catURL(), { cache: 'no-store' }); if (!r.ok) return null; return await shrink(await r.blob()); } catch (e) { return null; }
+      }));
+      batch.forEach(src => { if (src) { addCandidate(src); ok++; } });
+      if (ok === 0 && i >= 6) break;
+    }
+    rvInfo.textContent = ok ? 'Tap the good ones: clear cat faces, no costumes or memes. ' + picked.size + ' selected'
+      : 'Could not download photos. Check the internet connection, or use "Add my own photos" instead.';
+  }
+  function openReview() { picked.clear(); rvGrid.innerHTML = ''; review.style.display = 'block'; loadCandidates(24); }
+
+  /* ================= Meow synthesizer ================= */
+  let actx = null;
+  function synthMeow(pitch) {   // last-resort fallback if no real recordings are available
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') actx.resume();
+      const t = actx.currentTime, dur = 0.55;
+      const osc = actx.createOscillator(); osc.type = 'sawtooth';
+      const base = 470 * pitch;
+      osc.frequency.setValueAtTime(base * 0.85, t);
+      osc.frequency.linearRampToValueAtTime(base * 1.25, t + dur * 0.35);
+      osc.frequency.linearRampToValueAtTime(base * 0.55, t + dur);
+      const lfo = actx.createOscillator(), lg = actx.createGain();
+      lfo.frequency.value = 6.5;
+      lg.gain.setValueAtTime(base * 0.012, t); lg.gain.linearRampToValueAtTime(base * 0.035, t + dur * 0.4);
+      lfo.connect(lg); lg.connect(osc.frequency);
+      const f1 = actx.createBiquadFilter(), f2 = actx.createBiquadFilter();
+      f1.type = f2.type = 'bandpass'; f1.Q.value = 7; f2.Q.value = 9;
+      f1.frequency.setValueAtTime(400 * pitch, t);
+      f1.frequency.linearRampToValueAtTime(850 * pitch, t + dur * 0.55);
+      f1.frequency.linearRampToValueAtTime(600 * pitch, t + dur);
+      f2.frequency.setValueAtTime(2300 * pitch, t);
+      f2.frequency.linearRampToValueAtTime(1100 * pitch, t + dur * 0.55);
+      f2.frequency.linearRampToValueAtTime(800 * pitch, t + dur);
+      const g1 = actx.createGain(), g2 = actx.createGain(); g1.gain.value = 1; g2.gain.value = 0.5;
+      const g = actx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(0.16, t + 0.09);
+      g.gain.linearRampToValueAtTime(0.3, t + dur * 0.4);
+      g.gain.linearRampToValueAtTime(0.25, t + dur * 0.75);
+      g.gain.linearRampToValueAtTime(0.0001, t + dur);
+      osc.connect(f1); f1.connect(g1); osc.connect(f2); f2.connect(g2);
+      g1.connect(g); g2.connect(g); g.connect(actx.destination);
+      osc.start(t); lfo.start(t); osc.stop(t + dur + 0.05); lfo.stop(t + dur + 0.05);
+    } catch (e) {}
+  }
+  /* ---- Real cat recordings (CC0 / public domain, from OpenGameArt) ---- */
+  const DB_MEOW = 'boop-meows';
+  const MEOW_URLS = [
+    'https://opengameart.org/sites/default/files/Meow.ogg',
+    'https://opengameart.org/sites/default/files/kitten_mew-1_0.ogg',
+    'https://opengameart.org/sites/default/files/cat_mewfood.wav',
+    'https://opengameart.org/sites/default/files/cat_softmew.wav'
+  ];
+  let meowBuffers = [];   // decoded, ready to play (works offline)
+  let meowRemote = [];    // fallback: play straight from the web (needs internet)
+  function audioCtx() {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    return actx;
+  }
+  function decode(ab) {
+    return new Promise((res) => { try { audioCtx().decodeAudioData(ab, res, () => res(null)); } catch (e) { res(null); } });
+  }
+  async function addMeowBytes(ab, save) {
+    const buf = await decode(ab.slice(0));
+    if (!buf) return false;
+    meowBuffers.push(buf);
+    if (save) dbAdd(DB_MEOW, ab);
+    return true;
+  }
+  async function loadMeows() {
+    const cached = await dbGetAll(DB_MEOW);
+    for (const ab of cached) await addMeowBytes(ab, false);
+    if (meowBuffers.length) return;
+    for (const url of MEOW_URLS) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('http');
+        await addMeowBytes(await r.arrayBuffer(), true);
+      } catch (e) { /* blocked (e.g. CORS) - try the web-playback fallback below */ }
+    }
+    if (!meowBuffers.length) meowRemote = MEOW_URLS.slice();
+  }
+  function meow(pitch) {
+    try {
+      const rate = 0.9 + (pitch - 0.8) * 0.5;     // gentle variation, stays natural
+      if (meowBuffers.length) {
+        const ctx = audioCtx(); if (ctx.state === 'suspended') ctx.resume();
+        const src = ctx.createBufferSource(), g = ctx.createGain();
+        src.buffer = pick(meowBuffers); src.playbackRate.value = rate; g.gain.value = 0.9;
+        src.connect(g); g.connect(ctx.destination); src.start();
+        return;
+      }
+      if (meowRemote.length) {
+        const a = new Audio(pick(meowRemote)); a.playbackRate = rate;
+        a.play().catch(() => synthMeow(pitch));
+        return;
+      }
+    } catch (e) {}
+    synthMeow(pitch);
+  }
+  // tiny chirp for non-cat animals, so everyone gets a voice
+  function chirp() {
+    try {
+      if (!actx) return;
+      const t = actx.currentTime, o = actx.createOscillator(), g = actx.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(900, t); o.frequency.exponentialRampToValueAtTime(1800, t + 0.08);
+      o.frequency.exponentialRampToValueAtTime(1100, t + 0.2);
+      g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.18, t + 0.03); g.gain.linearRampToValueAtTime(0.0001, t + 0.22);
+      o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + 0.25);
+    } catch (e) {}
+  }
+
+  /* ================= Buddies ================= */
+  let W = area.clientWidth, H = area.clientHeight;
+  const buddies = [];
+  let uid = 0;
+  const pick = (a) => a[Math.floor(Math.random() * a.length)];
+  const photoDiv = (src, extra) => {
+    const p = document.createElement('div'); p.className = 'photo' + (extra || '');
+    p.style.backgroundImage = `url("${src}")`; return p;
+  };
+
+  const allPhotos = () => catPool.concat(photos);
+  function makeBuddy() {
+    const pool = allPhotos();
+    if (!pool.length) return null;
+    const size = Math.min(W, H) * 0.34;
+    const el = document.createElement('div');
+    el.className = 'buddy';
+    el.style.width = el.style.height = size + 'px';
+    el.appendChild(photoDiv(pick(pool)));
+    area.appendChild(el);
+    const b = {
+      id: uid++, kind: 'photo', el, size,
+      x: Math.random() * Math.max(1, W - size), y: Math.random() * Math.max(1, H - size),
+      vx: (Math.random() - 0.5) * 0.9, vy: (Math.random() - 0.5) * 0.9,
+      wob: Math.random() * 6.28, happy: 0
+    };
+    buddies.push(b);
+    return b;
+  }
+  function targetCount() { return Math.max(4, Math.round((W * H) / 220000)); }
+  function fill() { if (!allPhotos().length) return; while (buddies.length < targetCount()) makeBuddy(); }
+  function resetBuddies() { buddies.splice(0).forEach(b => b.el.remove()); fill(); }
+
+  window.addEventListener('resize', () => { W = area.clientWidth; H = area.clientHeight; fill(); });
+
+  function loop() {
+    for (const b of buddies) {
+      b.x += b.vx; b.y += b.vy;
+      if (b.x < 0) { b.x = 0; b.vx = Math.abs(b.vx); }
+      if (b.x > W - b.size) { b.x = W - b.size; b.vx = -Math.abs(b.vx); }
+      if (b.y < 0) { b.y = 0; b.vy = Math.abs(b.vy); }
+      if (b.y > H - b.size) { b.y = H - b.size; b.vy = -Math.abs(b.vy); }
+      // keep idle motion gentle: slowly ease back toward a calm speed
+      const sp = Math.hypot(b.vx, b.vy);
+      if (sp > 0.8) { b.vx *= 0.985; b.vy *= 0.985; }
+      else if (sp < 0.15) { b.vx += (Math.random() - 0.5) * 0.05; b.vy += (Math.random() - 0.5) * 0.05; }
+      b.wob += 0.03;
+      const wasHappy = b.happy > 0.3;
+      b.happy = Math.max(0, b.happy - 0.02);
+      const nowHappy = b.happy > 0.3;
+      if (wasHappy !== nowHappy) {
+        b.el.classList.toggle('glow', nowHappy);
+      }
+      b.el.style.transform = `translate(${b.x}px,${b.y}px) rotate(${Math.sin(b.wob) * 8}deg) scale(${1 + b.happy * 0.15})`;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  /* ================= Pop-out burst (a real cat head) ================= */
+  function burst(x, y) {
+    if (!allPhotos().length) return;
+    const el = document.createElement('div');
+    el.className = 'burst';
+    const size = Math.min(W, H) * 0.24;
+    el.style.width = el.style.height = size + 'px';
+    el.style.left = x + 'px'; el.style.top = y + 'px';
+    el.appendChild(photoDiv(pick(allPhotos()), ' glow'));
+    area.appendChild(el);
+    const angle = (Math.random() - 0.5) * 60, start = performance.now();
+    (function tick() {
+      const p = (performance.now() - start) / 800;
+      if (p >= 1) { el.remove(); return; }
+      const scale = p < 0.45 ? 0.2 + (p / 0.45) * 1.5 : 1.7 - ((p - 0.45) / 0.55) * 0.5;
+      el.style.opacity = p > 0.75 ? 1 - (p - 0.75) * 4 : 1;
+      el.style.transform = `translate(-50%,-50%) scale(${scale}) rotate(${angle}deg)`;
+      requestAnimationFrame(tick);
+    })();
+  }
+
+  /* ================= Input: every touch is a hit; multi-touch friendly ================= */
+  const starts = new Map();
+  area.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('#panel') || e.target.closest('#gear')) return;
+    e.preventDefault();
+    const rect = area.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    starts.set(e.pointerId, { x: px, y: py });
+    let hit = null;
+    for (const b of buddies) {
+      if (px > b.x - 30 && px < b.x + b.size + 30 && py > b.y - 30 && py < b.y + b.size + 30) { hit = b; break; }
+    }
+    meow(0.8 + Math.random() * 0.5);
+    if (hit) {
+      burst(hit.x + hit.size / 2, hit.y + hit.size / 2);
+      hit.vx = (Math.random() - 0.5) * 3; hit.vy = (Math.random() - 0.5) * 3; hit.happy = 1;
+    } else {
+      burst(px, py);
+    }
+  }, { passive: false });
+
+  function endPointer(e) {
+    const s = starts.get(e.pointerId); if (!s) return;
+    starts.delete(e.pointerId);
+    const rect = area.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    if (Math.hypot(px - s.x, py - s.y) > 60) {
+      for (const b of buddies) {
+        const cx = b.x + b.size / 2, cy = b.y + b.size / 2, d = Math.hypot(cx - px, cy - py) + 1;
+        b.vx = ((cx - px) / d) * (2.5 + Math.random() * 2);
+        b.vy = ((cy - py) / d) * (2.5 + Math.random() * 2);
+        b.happy = 1;
+      }
+      meow(1.2);
+    }
+  }
+  area.addEventListener('pointerup', endPointer);
+  area.addEventListener('pointercancel', (e) => starts.delete(e.pointerId));
+  area.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  /* ================= Grown-up panel (hold top-left corner 1.5s) ================= */
+  const gear = document.getElementById('gear'), panel = document.getElementById('panel');
+  const file = document.getElementById('file'), count = document.getElementById('photoCount');
+  function updateCount() {
+    count.textContent = catPool.length + ' cat photo(s) ready' + (photos.length ? ', ' + photos.length + ' of yours' : '') +
+      (catPool.length === 0 ? '. Add some photos to start.' : '.');
+  }
+  let holdT = null;
+  gear.addEventListener('pointerdown', (e) => { e.stopPropagation(); holdT = setTimeout(() => { updateCount(); panel.style.display = 'block'; }, 1500); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => gear.addEventListener(ev, () => clearTimeout(holdT)));
+  panel.addEventListener('pointerdown', (e) => e.stopPropagation());
+  document.getElementById('closePanel').onclick = () => { panel.style.display = 'none'; };
+  document.getElementById('fs').onclick = () => {
+    const d = document.documentElement;
+    (d.requestFullscreen || d.webkitRequestFullscreen || function () {}).call(d);
+    panel.style.display = 'none';
+  };
+  document.getElementById('findCats').onclick = () => { panel.style.display = 'none'; openReview(); };
+  document.getElementById('clearCats').onclick = async () => { await dbClear(DB_CATS); catPool = []; updateCount(); resetBuddies(); };
+  document.getElementById('rvOwn').onclick = () => file.click();
+  document.getElementById('rvMore').onclick = () => loadCandidates(12);
+  document.getElementById('rvClose').onclick = () => { review.style.display = 'none'; };
+  document.getElementById('rvSave').onclick = () => {
+    picked.forEach(src => { catPool.push(src); dbAdd(DB_CATS, src); });
+    review.style.display = 'none'; resetBuddies();
+  };
+  document.getElementById('addPhotos').onclick = () => file.click();
+  document.getElementById('clearPhotos').onclick = async () => { await dbClear(DB_USER); photos = []; updateCount(); resetBuddies(); };
+  file.onchange = async () => {
+    for (const f of file.files) { const d = await shrink(f); if (d) { photos.push(d); dbAdd(DB_USER, d); } }
+    file.value = ''; review.style.display = 'none'; resetBuddies(); panel.style.display = 'none';
+  };
+
+  const meowFile = document.getElementById('meowFile');
+  document.getElementById('addMeows').onclick = () => meowFile.click();
+  meowFile.onchange = async () => {
+    for (const f of meowFile.files) await addMeowBytes(await f.arrayBuffer(), true);
+    meowFile.value = ''; panel.style.display = 'none';
+  };
+
+  // keep the screen awake while he plays
+  async function wake() { try { await navigator.wakeLock.request('screen'); } catch (e) {} }
+  wake(); document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+
+  Promise.all([dbGetAll(DB_USER), dbGetAll(DB_CATS)]).then(([u, c]) => {
+    photos = u; catPool = c;
+    fill(); requestAnimationFrame(loop); loadMeows();
+    if (!allPhotos().length) openReview();   // first run: pick cat photos
+  });
+})();
+</script>
+</body>
+</html>
